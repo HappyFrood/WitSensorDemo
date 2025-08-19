@@ -11,14 +11,10 @@ import com.wit.witsdk.modular.sensor.modular.connector.modular.bluetooth.WitBlue
 import com.wit.witsdk.modular.sensor.modular.connector.modular.bluetooth.exceptions.BluetoothBLEException
 import com.wit.witsdk.modular.sensor.modular.connector.modular.bluetooth.interfaces.IBluetoothFoundObserver
 import com.wit.witsdk.modular.sensor.modular.processor.constant.WitSensorKey
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
 
 data class ImuData(
     val accX: Float? = null,
@@ -30,9 +26,23 @@ data class ImuData(
     val angleX: Float? = null,
     val angleY: Float? = null,
     val angleZ: Float? = null,
+    val q0: Float? = null,
+    val q1: Float? = null,
+    val q2: Float? = null,
+    val q3: Float? = null,
     val timestamp: Long? = null,
     val temperature: Float? = null,
     val battery: Float? = null
+)
+
+data class TimerData(
+    val isRunning: Boolean = false,
+    val currentElapsed: Float = 0f,
+    val scanStartTime: Float? = null,
+    val deviceFoundTime: Float? = null,
+    val connectedTime: Float? = null,
+    val configuredTime: Float? = null,
+    val firstDataTime: Float? = null
 )
 
 @SuppressLint("MissingPermission")
@@ -45,8 +55,12 @@ class WitMotionService : IBluetoothFoundObserver, IBwt901bleRecordObserver {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var witBluetoothManager: WitBluetoothManager? = null
     private var connectedSensor: Bwt901ble? = null
-    private var currentDataMode = 0
-    private var initialStateRead = false // Flag to ensure we only read state once
+
+    // Timer management
+    private var timerJob: Job? = null
+    private var startTimeMillis: Long = 0
+    private var hasReceivedFirstData = false
+    private var configurationComplete = false
 
     private val _isScanning = MutableStateFlow(false)
     val isScanning = _isScanning.asStateFlow()
@@ -58,6 +72,8 @@ class WitMotionService : IBluetoothFoundObserver, IBwt901bleRecordObserver {
     val imuData = _imuData.asStateFlow()
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage = _errorMessage.asStateFlow()
+    private val _timerData = MutableStateFlow(TimerData())
+    val timerData = _timerData.asStateFlow()
 
     fun initialize(context: Context) {
         try {
@@ -68,32 +84,68 @@ class WitMotionService : IBluetoothFoundObserver, IBwt901bleRecordObserver {
         }
     }
 
-    fun startScan() {
+    fun startScanAndConnect() {
         if (_isScanning.value || _isConnected.value) return
+
+        // Reset state
+        hasReceivedFirstData = false
+        configurationComplete = false
+        _errorMessage.value = null
+
+        // Start timer
+        startTimeMillis = System.currentTimeMillis()
+        _timerData.update {
+            TimerData(
+                isRunning = true,
+                scanStartTime = 0f
+            )
+        }
+
+        // Start timer updates
+        timerJob = serviceScope.launch {
+            while (isActive) {
+                val elapsed = (System.currentTimeMillis() - startTimeMillis) / 1000f
+                _timerData.update { current ->
+                    current.copy(currentElapsed = elapsed)
+                }
+                delay(10) // Update every 10ms
+            }
+        }
+
+        // Start scanning
         serviceScope.launch {
             try {
                 _isScanning.value = true
-                _errorMessage.value = null
                 witBluetoothManager?.registerObserver(this@WitMotionService)
                 witBluetoothManager?.startDiscovery()
+                Log.d(TAG, "Started scanning for devices")
             } catch (e: BluetoothBLEException) {
                 _errorMessage.value = "Scan Error: ${e.message}"
                 _isScanning.value = false
+                stopTimer()
             }
         }
     }
 
-    fun stopScan() {
-        serviceScope.launch {
-            witBluetoothManager?.stopDiscovery()
-            witBluetoothManager?.removeObserver(this@WitMotionService)
-            _isScanning.value = false
-        }
+    private fun stopTimer() {
+        timerJob?.cancel()
+        timerJob = null
+        _timerData.update { it.copy(isRunning = false) }
     }
 
     override fun onFoundBle(device: BluetoothBLE) {
+        Log.d(TAG, "Device discovered: ${device.name} ")
         if (device.name?.startsWith("WT") == true) {
-            stopScan()
+            // Record device found time
+            val elapsed = (System.currentTimeMillis() - startTimeMillis) / 1000f
+            _timerData.update { it.copy(deviceFoundTime = elapsed) }
+            Log.d(TAG, "Found device: ${device.name} at ${elapsed}s")
+
+            // Stop scanning and connect
+            witBluetoothManager?.stopDiscovery()
+            witBluetoothManager?.removeObserver(this@WitMotionService)
+            _isScanning.value = false
+
             connectToDevice(device)
         }
     }
@@ -103,7 +155,6 @@ class WitMotionService : IBluetoothFoundObserver, IBwt901bleRecordObserver {
     private fun connectToDevice(device: BluetoothBLE) {
         serviceScope.launch {
             try {
-                initialStateRead = false // Reset flag on new connection
                 val sensor = Bwt901ble(device)
                 sensor.registerRecordObserver(this@WitMotionService)
                 sensor.open()
@@ -112,197 +163,162 @@ class WitMotionService : IBluetoothFoundObserver, IBwt901bleRecordObserver {
                 _isConnected.value = true
                 _deviceName.value = sensor.deviceName
 
+                // Record connected time
+                val elapsed = (System.currentTimeMillis() - startTimeMillis) / 1000f
+                _timerData.update { it.copy(connectedTime = elapsed) }
+                Log.d(TAG, "Connected to device at ${elapsed}s")
+
+                // Start configuration
+                configureSensor()
+
             } catch (e: OpenDeviceException) {
                 _errorMessage.value = "Connection Failed: ${e.message}"
                 _isConnected.value = false
+                stopTimer()
+            }
+        }
+    }
+
+    private fun configureSensor() {
+        serviceScope.launch {
+            connectedSensor?.let { sensor ->
+                try {
+                    Log.d(TAG, "Starting sensor configuration...")
+
+                    // Unlock registers command: FF AA 69 88 B5
+                    val unlockCommand = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x69.toByte(), 0x88.toByte(), 0xB5.toByte())
+                    sensor.sendProtocolData(unlockCommand, 50)
+                    delay(200)
+                    Log.d(TAG, "Unlocked registers")
+
+                    // Set return rate to 200Hz (0x0B) via register 0x03: FF AA 03 0B 00
+                    var command = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x03.toByte(), 0x0B.toByte(), 0x00.toByte())
+                    sensor.sendProtocolData(command, 50)
+                    delay(250)
+                    Log.d(TAG, "Set return rate to 200Hz via register write")
+
+                    // Set data output mode to 2 (acc + gyro + timestamp) via register 0x96: FF AA 96 02 00
+                    command = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x96.toByte(), 0x02.toByte(), 0x00.toByte())
+                    sensor.sendProtocolData(command, 50)
+                    delay(200)
+                    Log.d(TAG, "Set output mode to 2 (Acc+Gyro+Timestamp)")
+
+                    // Set bandwidth to 256Hz (0x00) via register 0x1F: FF AA 1F 00 00
+                    command = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x1F.toByte(), 0x00.toByte(), 0x00.toByte())
+                    sensor.sendProtocolData(command, 50)
+                    delay(200)
+                    Log.d(TAG, "Set bandwidth to 256Hz")
+
+                    // Save configuration command: FF AA 00 00 00
+                    val saveCommand = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())
+                    sensor.sendProtocolData(saveCommand, 50)
+                    delay(300)
+                    Log.d(TAG, "Saved configuration")
+
+                    // Read back return rate register (0x03) to verify: FF AA 27 03 00
+                    val readRateCmd = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x27.toByte(), 0x03.toByte(), 0x00.toByte())
+                    sensor.sendProtocolData(readRateCmd, 50)
+                    delay(100)
+                    Log.d(TAG, "Sent command to read back return rate for verification")
+
+                    configurationComplete = true
+
+                    // Record configuration complete time
+                    val elapsed = (System.currentTimeMillis() - startTimeMillis) / 1000f
+                    _timerData.update { it.copy(configuredTime = elapsed) }
+                    Log.d(TAG, "Configuration complete at ${elapsed}s")
+
+                } catch (e: Exception) {
+                    _errorMessage.value = "Configuration failed: ${e.message}"
+                    Log.e(TAG, "Failed to configure sensor", e)
+                }
+            }
+        }
+    }
+
+    override fun onRecord(sensor: Bwt901ble) {
+        // Record first data time
+        if (!hasReceivedFirstData && configurationComplete) {
+            hasReceivedFirstData = true
+            val elapsed = (System.currentTimeMillis() - startTimeMillis) / 1000f
+            _timerData.update { it.copy(firstDataTime = elapsed) }
+            Log.d(TAG, "🎯 FIRST DATA RECEIVED at ${elapsed}s")
+            stopTimer()
+
+            // Start reading quaternions periodically since they're not in the main data packet
+            startQuaternionReading(sensor)
+        }
+
+        // Parse sensor data
+        val accX = sensor.getDeviceData(WitSensorKey.AccX)?.toFloatOrNull()
+        val accY = sensor.getDeviceData(WitSensorKey.AccY)?.toFloatOrNull()
+        val accZ = sensor.getDeviceData(WitSensorKey.AccZ)?.toFloatOrNull()
+
+        val gyroX = sensor.getDeviceData(WitSensorKey.AsX)?.toFloatOrNull()
+        val gyroY = sensor.getDeviceData(WitSensorKey.AsY)?.toFloatOrNull()
+        val gyroZ = sensor.getDeviceData(WitSensorKey.AsZ)?.toFloatOrNull()
+
+        val angleX = sensor.getDeviceData(WitSensorKey.AngleX)?.toFloatOrNull()
+        val angleY = sensor.getDeviceData(WitSensorKey.AngleY)?.toFloatOrNull()
+        val angleZ = sensor.getDeviceData(WitSensorKey.AngleZ)?.toFloatOrNull()
+
+        val q0 = sensor.getDeviceData(WitSensorKey.Q0)?.toFloatOrNull()
+        val q1 = sensor.getDeviceData(WitSensorKey.Q1)?.toFloatOrNull()
+        val q2 = sensor.getDeviceData(WitSensorKey.Q2)?.toFloatOrNull()
+        val q3 = sensor.getDeviceData(WitSensorKey.Q3)?.toFloatOrNull()
+
+        // The timestamp should be automatically parsed by the SDK when output mode 2 is active
+        val timestamp = sensor.getDeviceData(WitSensorKey.ChipTime)?.toLongOrNull()
+
+        val temperature = sensor.getDeviceData(WitSensorKey.T)?.toFloatOrNull()
+        val battery = sensor.getDeviceData(WitSensorKey.ElectricQuantityPercentage)?.toFloatOrNull()
+
+        _imuData.update {
+            ImuData(
+                accX = accX, accY = accY, accZ = accZ,
+                gyroX = gyroX, gyroY = gyroY, gyroZ = gyroZ,
+                angleX = angleX, angleY = angleY, angleZ = angleZ,
+                q0 = q0, q1 = q1, q2 = q2, q3 = q3,
+                timestamp = timestamp,
+                temperature = temperature,
+                battery = battery
+            )
+        }
+    }
+
+    private fun startQuaternionReading(sensor: Bwt901ble) {
+        serviceScope.launch {
+            // Request quaternion data periodically
+            while (_isConnected.value) {
+                try {
+                    // Read quaternion register (0x51): FF AA 27 51 00
+                    val readQuatCmd = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x27.toByte(), 0x51.toByte(), 0x00.toByte())
+                    sensor.sendProtocolData(readQuatCmd, 50)
+                } catch (e: Exception) {
+                    // Ignore errors in quaternion reading
+                }
+                delay(100) // Read quaternions every 100ms
             }
         }
     }
 
     fun disconnect() {
         serviceScope.launch {
-            if (currentDataMode != 0) {
-                setDataOutputMode(0)
-                delay(250)
-            }
+            stopTimer()
             connectedSensor?.close()
             connectedSensor?.removeRecordObserver(this@WitMotionService)
             connectedSensor = null
             _isConnected.value = false
             _deviceName.value = null
             _imuData.value = ImuData()
-            currentDataMode = 0
         }
     }
 
-    override fun onRecord(sensor: Bwt901ble) {
-        // If this is the first data packet, read the initial state.
-        if (!initialStateRead) {
-            readAndLogInitialState()
-            initialStateRead = true
-        }
-
-        var angleX: Float? = null; var angleY: Float? = null; var angleZ: Float? = null
-        var timestamp: Long? = null
-
-        if (currentDataMode == 0) {
-            angleX = sensor.getDeviceData(WitSensorKey.AngleX)?.toFloatOrNull()
-            angleY = sensor.getDeviceData(WitSensorKey.AngleY)?.toFloatOrNull()
-            angleZ = sensor.getDeviceData(WitSensorKey.AngleZ)?.toFloatOrNull()
-        } else if (currentDataMode == 2) {
-            try {
-                val tsBytes12 = sensor.getDeviceData("3d")?.toShort()
-                val tsBytes34 = sensor.getDeviceData("3e")?.toShort()
-
-                if (tsBytes12 != null && tsBytes34 != null) {
-                    val high = (tsBytes34.toLong() and 0xFFFF) shl 16
-                    val low = tsBytes12.toLong() and 0xFFFF
-                    timestamp = high or low
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to parse timestamp from raw registers", e)
-            }
-        }
-
-        val accX = sensor.getDeviceData(WitSensorKey.AccX)?.toFloatOrNull()
-        val accY = sensor.getDeviceData(WitSensorKey.AccY)?.toFloatOrNull()
-        val accZ = sensor.getDeviceData(WitSensorKey.AccZ)?.toFloatOrNull()
-        val gyroX = sensor.getDeviceData(WitSensorKey.AsX)?.toFloatOrNull()
-        val gyroY = sensor.getDeviceData(WitSensorKey.AsY)?.toFloatOrNull()
-        val gyroZ = sensor.getDeviceData(WitSensorKey.AsZ)?.toFloatOrNull()
-
-        _imuData.update {
-            it.copy(
-                accX = accX, accY = accY, accZ = accZ,
-                gyroX = gyroX, gyroY = gyroY, gyroZ = gyroZ,
-                angleX = angleX, angleY = angleY, angleZ = angleZ,
-                timestamp = timestamp,
-                temperature = sensor.getDeviceData(WitSensorKey.T)?.toFloatOrNull(),
-                battery = sensor.getDeviceData(WitSensorKey.ElectricQuantityPercentage)?.toFloatOrNull()
-            )
-        }
-    }
-
-    private fun sendCommand(register: Byte, value: Byte, description: String) {
-        serviceScope.launch {
-            connectedSensor?.let { sensor ->
-                try {
-                    sensor.unlockReg()
-                    delay(100)
-                    val command = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), register, value, 0x00)
-                    sensor.sendProtocolData(command, 50)
-                    delay(100)
-                    val saveCommand = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x00, 0x00, 0x00)
-                    sensor.sendProtocolData(saveCommand, 50)
-                } catch (e: Exception) {
-                    _errorMessage.value = "Failed to set $description"
-                }
-            }
-        }
-    }
-
-    fun setDataOutputMode(mode: Int) {
-        serviceScope.launch {
-            readRegister(0x96.toByte()) { currentMode ->
-                if (currentMode != null && currentMode.toInt() == mode) {
-                    Log.d(TAG, "Mode is already set to $mode. No action needed.")
-                    currentDataMode = mode
-                    return@readRegister
-                }
-
-                Log.d(TAG, "Changing mode from $currentMode to $mode.")
-                currentDataMode = mode
-                val modeByte = mode.toByte()
-                sendCommand(0x96.toByte(), modeByte, "Data Mode to $mode")
-            }
-        }
-    }
-
-    private fun readRegister(register: Byte, callback: (Short?) -> Unit) {
-        connectedSensor?.let { sensor ->
-            try {
-                val registerKey = String.format("%02x", register)
-
-                val observer = object : IBwt901bleRecordObserver {
-                    override fun onRecord(bwt901ble: Bwt901ble) {
-                        val deviceData = bwt901ble.getDeviceData(registerKey)
-                        if (deviceData != null) {
-                            try {
-                                val value = deviceData.toShort()
-                                callback(value)
-                                sensor.removeRecordObserver(this)
-                            } catch (e: NumberFormatException) {
-                                Log.e(TAG, "Failed to parse Short from register $registerKey", e)
-                                callback(null)
-                                sensor.removeRecordObserver(this)
-                            }
-                        }
-                    }
-                }
-
-                sensor.registerRecordObserver(observer)
-
-                val readCmd = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x27, register, 0x00)
-                sensor.sendProtocolData(readCmd, 50)
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Generic failure to read register $register", e)
-                callback(null)
-            }
-        } ?: callback(null)
-    }
-
-    fun readAndLogInitialState() {
-        serviceScope.launch {
-            Log.d(TAG, "========================================")
-            Log.d(TAG, "First data packet received, reading initial state...")
-
-            readRegister(0x96.toByte()) { outputMode ->
-                if (outputMode != null) {
-                    Log.d(TAG, "✅ Current Output Mode (Reg 0x96): ${outputMode.toInt()}")
-                    currentDataMode = outputMode.toInt()
-                } else {
-                    Log.e(TAG, "❌ Failed to read Output Mode.")
-                }
-            }
-
-            delay(200)
-
-            readRegister(0x03.toByte()) { returnRate ->
-                if (returnRate != null) {
-                    Log.d(TAG, "✅ Current Return Rate (Reg 0x03): ${returnRate.toInt()}")
-                } else {
-                    Log.e(TAG, "❌ Failed to read Return Rate.")
-                }
-            }
-
-            delay(200)
-
-            readRegister(0x1F.toByte()) { bandwidth ->
-                if (bandwidth != null) {
-                    Log.d(TAG, "✅ Current Bandwidth (Reg 0x1F): ${bandwidth.toInt()}")
-                } else {
-                    Log.e(TAG, "❌ Failed to read Bandwidth.")
-                }
-                Log.d(TAG, "========================================")
-            }
-        }
-    }
-
-    fun setReturnRate(rateHz: Int) {
-        val value = when (rateHz) {
-            10 -> 0x06.toByte(); 50 -> 0x08.toByte(); 100 -> 0x09.toByte(); 200 -> 0x0B.toByte()
-            else -> 0x08.toByte()
-        }
-        sendCommand(0x03.toByte(), value, "Return Rate to $rateHz Hz")
-    }
-
-    fun setBandwidth(bandwidthHz: Int) {
-        val value = when (bandwidthHz) {
-            256 -> 0x00.toByte(); 188 -> 0x01.toByte(); 98 -> 0x02.toByte(); 42 -> 0x03.toByte();
-            20 -> 0x04.toByte(); 10 -> 0x05.toByte(); 5 -> 0x06.toByte()
-            else -> 0x04.toByte()
-        }
-        sendCommand(0x1F.toByte(), value, "Bandwidth to $bandwidthHz Hz")
+    fun reset() {
+        disconnect()
+        _timerData.value = TimerData()
+        _errorMessage.value = null
+        hasReceivedFirstData = false
+        configurationComplete = false
     }
 }
