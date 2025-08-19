@@ -203,43 +203,53 @@ class WitMotionService : IBluetoothFoundObserver, IBwt901bleRecordObserver {
 
     fun setDataOutputMode(mode: Int) {
         serviceScope.launch {
-            val currentMode = readRegister(0x96.toByte())
-            if (currentMode != null && currentMode.toInt() == mode) {
-                Log.d(TAG, "Mode is already set to $mode. No action needed.")
-                currentDataMode = mode
-                return@launch
-            }
+            readRegister(0x96.toByte()) { currentMode ->
+                if (currentMode != null && currentMode.toInt() == mode) {
+                    Log.d(TAG, "Mode is already set to $mode. No action needed.")
+                    currentDataMode = mode
+                    return@readRegister
+                }
 
-            Log.d(TAG, "Changing mode from $currentMode to $mode.")
-            currentDataMode = mode
-            val modeByte = mode.toByte()
-            sendCommand(0x96.toByte(), modeByte, "Data Mode to $mode")
+                Log.d(TAG, "Changing mode from $currentMode to $mode.")
+                currentDataMode = mode
+                val modeByte = mode.toByte()
+                sendCommand(0x96.toByte(), modeByte, "Data Mode to $mode")
+            }
         }
     }
 
-    private suspend fun readRegister(register: Byte): Short? {
+    private fun readRegister(register: Byte, callback: (Short?) -> Unit) {
         connectedSensor?.let { sensor ->
             try {
+                val registerKey = String.format("%02x", register)
+
+                val observer = object : IBwt901bleRecordObserver {
+                    override fun onRecord(bwt901ble: Bwt901ble) {
+                        val deviceData = bwt901ble.getDeviceData(registerKey)
+                        if (deviceData != null) {
+                            try {
+                                val value = deviceData.toShort()
+                                callback(value)
+                                sensor.removeRecordObserver(this)
+                            } catch (e: NumberFormatException) {
+                                Log.e(TAG, "Failed to parse Short from register $registerKey", e)
+                                callback(null)
+                                sensor.removeRecordObserver(this)
+                            }
+                        }
+                    }
+                }
+
+                sensor.registerRecordObserver(observer)
+
                 val readCmd = byteArrayOf(0xFF.toByte(), 0xAA.toByte(), 0x27, register, 0x00)
                 sensor.sendProtocolData(readCmd, 50)
-                delay(300)
-                val registerKey = String.format("%02x", register)
-                val deviceData = sensor.getDeviceData(registerKey)
 
-                if (deviceData != null) {
-                    return deviceData.toShort()
-                } else {
-                    Log.w(TAG, "Read command for register $registerKey returned null.")
-                }
-            } catch (e: NumberFormatException) {
-                Log.e(TAG, "Failed to parse Short from register $register", e)
-                return null
             } catch (e: Exception) {
                 Log.e(TAG, "Generic failure to read register $register", e)
-                return null
+                callback(null)
             }
-        }
-        return null
+        } ?: callback(null)
     }
 
     fun readAndLogInitialState() {
@@ -247,33 +257,35 @@ class WitMotionService : IBluetoothFoundObserver, IBwt901bleRecordObserver {
             Log.d(TAG, "========================================")
             Log.d(TAG, "First data packet received, reading initial state...")
 
-            // Read registers one by one with a delay between them to ensure reliability
-            val outputMode = readRegister(0x96.toByte())
-            if (outputMode != null) {
-                Log.d(TAG, "✅ Current Output Mode (Reg 0x96): ${outputMode.toInt()}")
-                currentDataMode = outputMode.toInt()
-            } else {
-                Log.e(TAG, "❌ Failed to read Output Mode.")
+            readRegister(0x96.toByte()) { outputMode ->
+                if (outputMode != null) {
+                    Log.d(TAG, "✅ Current Output Mode (Reg 0x96): ${outputMode.toInt()}")
+                    currentDataMode = outputMode.toInt()
+                } else {
+                    Log.e(TAG, "❌ Failed to read Output Mode.")
+                }
             }
 
-            delay(200) // Add a pause between read commands
+            delay(200)
 
-            val returnRate = readRegister(0x03.toByte())
-            if (returnRate != null) {
-                Log.d(TAG, "✅ Current Return Rate (Reg 0x03): ${returnRate.toInt()}")
-            } else {
-                Log.e(TAG, "❌ Failed to read Return Rate.")
+            readRegister(0x03.toByte()) { returnRate ->
+                if (returnRate != null) {
+                    Log.d(TAG, "✅ Current Return Rate (Reg 0x03): ${returnRate.toInt()}")
+                } else {
+                    Log.e(TAG, "❌ Failed to read Return Rate.")
+                }
             }
 
-            delay(200) // Add a pause between read commands
+            delay(200)
 
-            val bandwidth = readRegister(0x1F.toByte())
-            if (bandwidth != null) {
-                Log.d(TAG, "✅ Current Bandwidth (Reg 0x1F): ${bandwidth.toInt()}")
-            } else {
-                Log.e(TAG, "❌ Failed to read Bandwidth.")
+            readRegister(0x1F.toByte()) { bandwidth ->
+                if (bandwidth != null) {
+                    Log.d(TAG, "✅ Current Bandwidth (Reg 0x1F): ${bandwidth.toInt()}")
+                } else {
+                    Log.e(TAG, "❌ Failed to read Bandwidth.")
+                }
+                Log.d(TAG, "========================================")
             }
-            Log.d(TAG, "========================================")
         }
     }
 
