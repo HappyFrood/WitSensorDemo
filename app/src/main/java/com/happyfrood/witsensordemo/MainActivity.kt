@@ -244,9 +244,54 @@ fun TimingRow(label: String, time: Float?, isHighlight: Boolean = false) {
     }
 }
 
+private fun getOutputModeDescription(mode: String?): String {
+    return when (mode) {
+        "0" -> "Mode 0: Acc+Gyro+Angle"
+        "1" -> "Mode 1: Displacement+Speed+Angle"
+        "2" -> "Mode 2: Acc+Gyro+Timestamp"
+        "3" -> "Mode 3: Displacement+Speed+Timestamp"
+        else -> "Mode: ${mode ?: "Unknown"}"
+    }
+}
+
+private fun isTimestampMode(mode: String?): Boolean {
+    return mode == "2" || mode == "3"
+}
+
 @Composable
 fun SensorDataDisplay(data: ImuData) {
     LazyColumn(modifier = Modifier.fillMaxWidth()) {
+        // Output mode display
+        if (data.outputMode != null) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isTimestampMode(data.outputMode))
+                            Color(0xFF4CAF50).copy(alpha = 0.1f)
+                        else Color(0xFF2196F3).copy(alpha = 0.1f)
+                    )
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            "✅ ${getOutputModeDescription(data.outputMode)}",
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            if (isTimestampMode(data.outputMode)) {
+                                "Timestamp mode: AngleX/Y contain timestamp data"
+                            } else {
+                                "Angle mode: AngleX/Y/Z contain rotation angles"
+                            },
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                    }
+                }
+            }
+        }
+
         item { DataHeader("Acceleration (G)") }
         item { DataRow("Acc X", data.accX) }
         item { DataRow("Acc Y", data.accY) }
@@ -257,10 +302,19 @@ fun SensorDataDisplay(data: ImuData) {
         item { DataRow("Gyro Y", data.gyroY) }
         item { DataRow("Gyro Z", data.gyroZ) }
 
-        item { DataHeader("Angle (°)") }
-        item { DataRow("Angle X", data.angleX) }
-        item { DataRow("Angle Y", data.angleY) }
-        item { DataRow("Angle Z", data.angleZ) }
+        if (isTimestampMode(data.outputMode)) {
+            item { DataHeader("Timestamp Mode Data") }
+            if (data.outputMode == "2") {
+                item { DataRow("Heading (°)", data.angleZ) }
+            }
+            item { DataRow("Timestamp (ms)", data.timestamp) }
+        } else {
+            item { DataHeader("Angle (°)") }
+            item { DataRow("Angle X", data.angleX) }
+            item { DataRow("Angle Y", data.angleY) }
+            item { DataRow("Angle Z", data.angleZ) }
+            item { DataRow("Chip Time (ms)", data.timestamp) }
+        }
 
         item { DataHeader("Quaternion") }
         item { DataRow("q0 (W)", data.q0) }
@@ -269,7 +323,6 @@ fun SensorDataDisplay(data: ImuData) {
         item { DataRow("q3 (Z)", data.q3) }
 
         item { DataHeader("Device Info") }
-        item { DataRow("Chip Time (ms)", data.timestamp) }
         item { DataRow("Temperature (°C)", data.temperature) }
         item { DataRow("Battery (%)", data.battery) }
     }
